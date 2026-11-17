@@ -41,6 +41,53 @@ export type Retention = "ephemeral" | "session" | "persistent";
 
 export type ArtifactStoreKind = "file" | "object_store" | "sqlite" | "s3";
 
+/**
+ * Multi-resolution rendering tiers for ContextHarness (CPAT v2):
+ *   "full"     — exact verbatim text from ContentStore (<id>@v<version>).
+ *   "skeleton" — deterministic structural outline + regex-extracted identifiers (<2ms, 0 LLM cost).
+ *   "digest"   — sidecar-computed FactDigest (verbatim facts + ruled-out leads + query hint).
+ *   "landmark" — 1-line byte-stable address handle (~20 tokens).
+ */
+export type ResolutionLevel = "full" | "skeleton" | "digest" | "landmark";
+
+/**
+ * Epistemic authority tiers (inspired by AC3 & Hindsight):
+ *   "authoritative" — system prompt & user specifications; never overwritten by subjective turns.
+ *   "observation"   — objective tool outputs & environment observations; losslessly indexed.
+ *   "subjective"    — assistant reasoning, hypotheses, and plans; eligible for pollution audit.
+ */
+export type EpistemicTier = "authoritative" | "observation" | "subjective";
+
+export interface FactDigest {
+  summary: string;
+  verbatim_facts: string[];
+  ruled_out: string[];
+  query_hint: string;
+  generated_by: "sidecar" | "deterministic";
+}
+
+export interface BlockResolutions {
+  skeleton?: string;
+  digest?: FactDigest;
+  landmark: string;
+}
+
+export interface ScopeNode {
+  id: string;
+  parent_id?: string;
+  label: string;
+  goal: string;
+  status: "active" | "completed" | "aborted";
+  /** Block id immediately preceding this scope's opening turn (for stack-aligned rollback). */
+  entry_after_id?: string;
+  block_ids: string[];
+  child_scope_ids: string[];
+  submitted_result?: string;
+  key_facts?: string[];
+  summary_block_id?: string;
+  created_at: string;
+}
+
 export interface ArtifactRef {
   artifact_id: string;
   uri: string; // artifact://<id>
@@ -59,9 +106,22 @@ export interface ContextBlock {
 
   source_ids: string[];
   token_count: number;
+  /** Original full-payload token count before any offload or resolution degradation. */
+  raw_tokens?: number;
 
   visibility: Visibility;
   retention: Retention;
+
+  /** Harness v2 epistemic authority tier. */
+  epistemic?: EpistemicTier;
+  /** Harness v2 active rendering tier (defaults to "full"). */
+  active_resolution?: ResolutionLevel;
+  /** Harness v2 pre-computed multi-resolution projections. */
+  resolutions?: BlockResolutions;
+  /** Owning ScopeNode id if created inside a subtask scope. */
+  scope_id?: string;
+  /** Pinned high-utility evidence kept inline across routine batch degradations. */
+  pinned?: boolean;
 
   protected?: boolean;
   version: number;
@@ -170,6 +230,30 @@ export type ContextOperation =
         content: string;
       };
       scope_label: string;
+    }
+  | {
+      // Harness v2: zero-copy multi-resolution switch without changing kind,
+      // version, or tool-call chain membership.
+      op: "set_resolution";
+      ids: string[];
+      resolution: ResolutionLevel;
+    }
+  | {
+      // Harness v2: pin or unpin high-utility blocks from routine batch degradation.
+      op: "set_pinned";
+      ids: string[];
+      pinned: boolean;
+    }
+  | {
+      // Harness v2 (AC3 isolated pollution audit): archive tainted subjective
+      // blocks (chains closed) while keeping authoritative & objective evidence,
+      // optionally inserting a clean authoritative checkpoint note.
+      op: "purge_pollution";
+      ids: string[];
+      clean_checkpoint?: {
+        description: string;
+        content: string;
+      };
     };
 
 export interface ContextUpdateRequest {
@@ -192,6 +276,8 @@ export interface PatchResult {
   budget: TokenBudget;
 }
 
+export type PatchActor = "agent" | "runtime" | "harness";
+
 export type JournalEvent =
   | {
       type: "ingest";
@@ -208,7 +294,7 @@ export type JournalEvent =
       type: "patch";
       seq: number;
       ts: string;
-      actor: "agent" | "runtime";
+      actor: PatchActor;
       reason: string;
       operations: ContextOperation[];
       result: PatchResult;
@@ -221,6 +307,36 @@ export type JournalEvent =
       usage: ChatUsage;
       visible_blocks: number;
       est_view_tokens: number;
+    }
+  | {
+      type: "sidecar_call";
+      seq: number;
+      ts: string;
+      purpose: "digest" | "decision" | "sub_reader" | "pollution_audit";
+      model: string;
+      usage: ChatUsage;
+      duration_ms: number;
+      target_ids?: string[];
+    }
+  | {
+      type: "decision";
+      seq: number;
+      ts: string;
+      trigger: string;
+      phase: string;
+      committed: boolean;
+      reason: string;
+      net_benefit_est: number;
+      ops_count: number;
+    }
+  | {
+      type: "scope";
+      seq: number;
+      ts: string;
+      action: "open" | "submit" | "abort";
+      scope_id: string;
+      label: string;
+      freed_tokens?: number;
     };
 
 // ---------------------------------------------------------------------------
@@ -276,6 +392,7 @@ export interface ChatUsage {
   total_tokens: number;
   prompt_cache_hit_tokens?: number;
   prompt_cache_miss_tokens?: number;
+  reasoning_tokens?: number;
 }
 
 export interface ChatResponse {
@@ -285,11 +402,46 @@ export interface ChatResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime configuration
+// Pricing & True Cost Accounting (Harness v2)
+// ---------------------------------------------------------------------------
+
+export interface ModelPricing {
+  /** USD per 1M cache-miss input tokens. */
+  inputMissPerM: number;
+  /** USD per 1M cache-hit input tokens. */
+  inputHitPerM: number;
+  /** USD per 1M output (completion + reasoning) tokens. */
+  outputPerM: number;
+}
+
+export interface CostBreakdown {
+  main_prompt_tokens: number;
+  main_cache_hit_tokens: number;
+  main_cache_miss_tokens: number;
+  main_completion_tokens: number;
+  sidecar_calls: number;
+  sidecar_prompt_tokens: number;
+  sidecar_completion_tokens: number;
+  main_cache_hit_usd: number;
+  main_cache_miss_usd: number;
+  main_output_usd: number;
+  sidecar_total_usd: number;
+  /** Total real dollar spend across main (cache-adjusted) + sidecar. */
+  effective_cost_usd: number;
+  /** Hypothetical main-only cost if zero prefix cache hits occurred. */
+  uncached_main_equivalent_usd: number;
+  /** Critical-path wall-clock latency added synchronously by the harness (ms). */
+  harness_critical_path_ms: number;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime & Harness configuration
 // ---------------------------------------------------------------------------
 
 export interface CpatConfig {
   model: string;
+  /** Optional cheap model used by the independent ContextHarness sidecar. */
+  sidecarModel?: string;
   /** Working context budget. Keep far below the real 1M window for experiments. */
   maxContextTokens: number;
   /** Fraction of max at which a budget_report block is injected (default 0.7). */
@@ -313,4 +465,32 @@ export interface CpatConfig {
   maxTurns: number;
   runDir: string;
   verbose: boolean;
+}
+
+export type HarnessMode = "cooperative" | "query_only" | "transparent";
+
+export interface HarnessConfig {
+  maxContextTokens: number;
+  /**
+   * Target steady-state raw tail budget before batch-degrading older digested
+   * blocks. Defaults to min(14_000, Math.floor(maxContextTokens * 0.55)) so
+   * even 200K windows stay lean (~15K–25K active) while micro-batching 2–3
+   * reads for 100% intra-batch prefix cache hits.
+   */
+  workingTailTokens?: number;
+  softLimitRatio?: number;
+  mustActRatio?: number;
+  criticalRatio?: number;
+  /** Minimum block tokens worth digesting / degrading (default 320). */
+  minDigestTokens?: number;
+  /** Number of most-recent tool chains kept at "full" resolution (default 1). */
+  keepRecentFullChains?: number;
+  /** Expected remaining turns horizon for EconomicCommitGate (default 8). */
+  expectedHorizonTurns?: number;
+  mode?: HarnessMode;
+  sidecarModel?: string;
+  mainPricing?: ModelPricing;
+  sidecarPricing?: ModelPricing;
+  runDir: string;
+  verbose?: boolean;
 }

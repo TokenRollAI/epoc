@@ -68,6 +68,49 @@ export function buildMessages(
   };
 }
 
+/**
+ * Harness v2 strict prefix-preserving view compiler (L0..L4).
+ *
+ * Unlike v1 `buildMessages`:
+ *   1. Blocks render strictly in structural/arrival order (`store.visible()`):
+ *      newly ingested blocks NEVER jump ahead of older blocks, eliminating the
+ *      `layoutGenerational` newest-first cache-invalidation bug.
+ *   2. No per-turn `<context_manifest>` user message is tacked onto the end of
+ *      tool-calling turns — every normal turn is a 100% pure byte-for-byte
+ *      prefix extension of the previous turn!
+ */
+export function buildHarnessMessages(
+  store: BlockStore,
+  ephemeralTailMessages?: ChatMessage[],
+): {
+  messages: ChatMessage[];
+  view: ContextView;
+} {
+  const messages: ChatMessage[] = [];
+  const viewIds: string[] = [];
+
+  for (const block of store.visible()) {
+    viewIds.push(block.id);
+    messages.push(renderBlock(store, block));
+  }
+
+  if (ephemeralTailMessages?.length) {
+    messages.push(...ephemeralTailMessages);
+  }
+
+  const estTokens =
+    messages.reduce((s, m) => s + estimateTokens(m.content ?? "") + estimateTokens(m.reasoning_content ?? ""), 0) +
+    messages.length * 4;
+
+  return {
+    messages,
+    view: {
+      blocks: viewIds,
+      token_budget: { max: 0, soft_limit: 0, used: estTokens },
+    },
+  };
+}
+
 /** Token threshold above which a tool_result is treated as a volatile L2 payload. */
 const TAIL_PAYLOAD_TOKENS = 300;
 

@@ -33,7 +33,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { CpatConfig } from "../src/types.ts";
-import { loadDeepSeekEnv } from "../src/util/env.ts";
+import { loadDeepSeekEnv, loadSidecarEnv } from "../src/util/env.ts";
 import { DeepSeekClient } from "../src/deepseek/client.ts";
 import { runAgent } from "../src/agent/loop.ts";
 import type { AgentMode } from "../src/agent/loop.ts";
@@ -47,6 +47,7 @@ interface Args {
   docTokens: number;
   turns: number;
   model: string;
+  sidecarModel?: string;
   dryRun: boolean;
 }
 
@@ -55,16 +56,17 @@ function usage(message?: string): never {
   console.error(`Deep-research long-horizon benchmark for CPAT
 
 Usage:
-  node bench/deepresearch.ts --mode cpat|react|threshold [options]
+  node bench/deepresearch.ts --mode harness|cpat|react|threshold [options]
 
 Options:
-  --mode <m>           react | threshold | cpat (required).
+  --mode <m>           react | threshold | cpat | harness (required).
   --hard-window <n>    Hard context window in tokens (default 200000).
   --docs <k>           Number of dossiers in the corpus (default 30).
   --questions <m>      Questions asked in sequence, incl. revisits (default 12).
   --doc-tokens <n>     Approx tokens per dossier (default 12000).
   --turns <n>          Max total agent turns across all questions (default 120).
-  --model <name>       DeepSeek model (default deepseek-v4-pro).`);
+  --model <name>       Main model (default deepseek-flash).
+  --sidecar-model <m>  Sidecar cheap model for harness (default deepseek-flash).`);
   process.exit(1);
 }
 
@@ -83,17 +85,24 @@ function parseArgs(argv: string[]): Args {
   }
   const mode = flags.get("mode") as AgentMode | undefined;
   const dryRun = bools.has("dry-run");
-  if (!dryRun && mode !== "cpat" && mode !== "react" && mode !== "threshold") {
-    usage(`--mode must be react | threshold | cpat`);
+  if (
+    !dryRun &&
+    mode !== "cpat" &&
+    mode !== "react" &&
+    mode !== "threshold" &&
+    mode !== "harness"
+  ) {
+    usage(`--mode must be react | threshold | cpat | harness`);
   }
   return {
-    mode: (mode ?? "react") as AgentMode,
+    mode: (mode ?? "harness") as AgentMode,
     hardWindow: Number(flags.get("hard-window") ?? 200000),
     docs: Number(flags.get("docs") ?? 30),
     questions: Number(flags.get("questions") ?? 12),
     docTokens: Number(flags.get("doc-tokens") ?? 12000),
     turns: Number(flags.get("turns") ?? 120),
-    model: flags.get("model") ?? "deepseek-v4-pro",
+    model: flags.get("model") ?? "deepseek-flash",
+    sidecarModel: flags.get("sidecar-model"),
     dryRun,
   };
 }
@@ -316,6 +325,9 @@ async function main(): Promise<void> {
 
   const env = loadDeepSeekEnv();
   const client = new DeepSeekClient(env);
+  const sidecarEnv = loadSidecarEnv();
+  const sidecarClient =
+    args.sidecarModel === "none" ? undefined : new DeepSeekClient(sidecarEnv);
 
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const benchDir = join("runs", `deepresearch-${args.mode}-w${args.hardWindow}-${ts}`);
@@ -348,6 +360,7 @@ async function main(): Promise<void> {
   // Tie CPAT's pressure ladder to the hard window so they coincide.
   const config: CpatConfig = {
     model: args.model,
+    sidecarModel: args.sidecarModel ?? sidecarEnv.model,
     maxContextTokens: args.hardWindow,
     softLimitRatio: 0.7,
     mustActRatio: 0.8,
@@ -378,6 +391,7 @@ async function main(): Promise<void> {
       followups: questions.slice(1).map((q, i) => followup(q, i + 1)),
       config,
       client,
+      sidecarClient,
       workdir: resolve(benchDir),
       mode: args.mode,
       hardWindowTokens: args.hardWindow,
@@ -429,7 +443,12 @@ async function main(): Promise<void> {
     terminated_early: m?.terminated_early ?? null,
     api_error: apiError ?? null,
     peak_view_tokens: m?.peak_view_tokens ?? 0,
+    mean_view_tokens: m?.mean_view_tokens ?? 0,
     total_prompt_tokens: m?.prompt_tokens ?? 0,
+    cache_hit_ratio: m?.cache_hit_ratio ?? 0,
+    effective_cost_usd: m?.cost.effective_cost_usd ?? 0,
+    sidecar_total_usd: m?.cost.sidecar_total_usd ?? 0,
+    context_query_calls: m?.context_query_calls ?? 0,
     turns: run?.turns ?? 0,
     offloads: (ops.payload_offload ?? 0) as number,
     restores: (ops.restore ?? 0) as number,
