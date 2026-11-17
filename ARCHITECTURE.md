@@ -1,197 +1,116 @@
-# ARCHITECTURE — `context_update` 工具的设计与实现
+# ARCHITECTURE — epoc (Epoch Context) 三层 Cache-First 架构与上下文引擎详解
 
-> 本文说明 CPAT 的核心：`context_update` 这个工具**应该怎么设计**、目前**提供哪些能力**、
-> 以及**具体怎么实现**。读者对象是想理解或扩展 CPAT 的工程师。
-> 配套：运行时细节见 [`llmdoc/architecture/context-runtime.md`](https://github.com/TokenRollAI/CPAT/blob/main/llmdoc/architecture/context-runtime.md)，
-> 研究动机与验证见 [`research/`](https://github.com/TokenRollAI/CPAT/tree/main/research)。
-
----
-
-## 1. 设计哲学：上下文是 agent 治理的一等公民
-
-传统 agent 把上下文当成只增不改的 append-only 日志，压缩交给框架在阈值处被动触发。
-CPAT 的命题相反：**把"编辑未来上下文"做成一个 agent 可调用的、受校验的工具**，让 agent 在
-推理过程中主动决定保留/卸载/恢复/合并哪些信息。
-
-这个设计要同时满足四个约束，它们决定了下面所有实现细节：
-
-| 约束 | 为什么 | 实现后果 |
-|---|---|---|
-| **可校验** | agent 会犯错（破坏 API 协议、压掉关键信息） | 事务式 patch 引擎，任一 op 被拒整体回滚 |
-| **可逆** | "先放下、后又需要"是长程任务常态 | `payload_offload` ↔ `restore` 零拷贝对；archive 可恢复 |
-| **审计可重放** | 研究需要知道每个决策的后果 | append-only Journal 记录每次 patch |
-| **缓存友好** | 频繁改写上下文会摧毁 KV-cache | 稳定前缀 + 易变尾部；操作偏好 tail-local |
-
-> 设计张力先讨论再实现：参见 [`llmdoc/memory/decisions/`](https://github.com/TokenRollAI/CPAT/tree/main/llmdoc/memory/decisions)（如 0001 单份存储、0002 offload 不改 kind）。
+> 本文档面向希望深入理解、调优或扩展 **`epoc`（前身原型 `CPAT`）** 的工程师，完整拆解核心架构层次（关于外部多客户端网关 `ShadowLedger` 与 `codex` / `claude code` / `agy` / `kimi` / `pi` / `dsh` 六宿主接入设计，请同步参阅 [ROADMAP.md](ROADMAP.md)）：
+> 1. **第一性原理：`50:1` 前缀缓存经济学与零后缀偏移定律（Zero-Suffix Shift Law）**
+> 2. **生产主形态：三层 Cache-First Pi 插件架构（`extensions/pi-cpat.ts` + `src/sidecar/tool-projector.ts`）**
+> 3. **内核引擎：独立 `ContextHarness`（`src/harness/` + `src/sidecar/`）与事务式 `context_update` Patch 引擎（`src/runtime/`）**
 
 ---
 
-## 2. 数据模型：工具操作的对象
+## 1. 第一性原理：`50:1` 前缀缓存经济学
 
-`context_update` 操作的不是消息，而是 **block**。每条进入系统的消息成为一个 `ContextBlock`
-（`src/types.ts`）：
+现代大模型推理服务（如 DeepSeek、Anthropic、OpenAI Prefix Caching）普遍采用极高折扣的 KV Cache 命中定价。以 DeepSeek V4.1 Flash 为例：
 
-```ts
-interface ContextBlock {
-  id: string;                       // 寻址键，patch 用它指定目标
-  kind: BlockKind;                  // 这个块"是什么"
-  content: string | ArtifactRef;    // inline 文本，或 offload 后的引用
-  visibility: Visibility;           // 决定是否渲染进下一轮 view
-  version: number;                  // 配合 ContentStore 的 <id>@v<version> 键
-  source_ids: string[];             // summary 块指向它压缩了哪些源
-  protected?: boolean;              // system / user 原件
-  api?: { tool_call_id?, tool_calls?, reasoning_content? };  // API 协议回放字段，agent 永不可碰
-}
-```
+| 计费项 | 单价（USD / 1M tokens） | 相对倍率 |
+| :--- | :---: | :---: |
+| 前缀缓存命中读取（$P_{\text{hit}}$） | **`$0.003`** | **`1×`（基准）** |
+| 未命中输入预填充（$P_{\text{miss}}$） | **`$0.150`** | **`50×`** |
+| 模型生成输出（$P_{\text{out}}$） | **`$0.600`** | **`200×`** |
 
-**9 个 `BlockKind`**：`system_prompt` / `user_message` / `assistant_message` / `reasoning_trace` /
-`tool_result` / `summary` / `artifact_ref`（遗留）/ `task_state` / `budget_report`。
+### 1.1 为什么“固定步频中段压缩”在 400K 窗口下必亏？
 
-**4 个 `Visibility`**：
-- `model` — 渲染进下一轮 view。
-- `archived` — 不渲染，但列入 manifest，可经 `set_visibility=model` 恢复。
-- `hidden` — 不渲染、不列 manifest（彻底移出，但内容仍在 ContentStore）。
-- `api_required` — runtime 内部态（thinking 链开启期间的 reasoning_trace），agent 不可 patch。
+假设上下文累计到 $150\text{K}$ 时，插件将前 $80\text{K}$ 历史压缩为 $5\text{K}$ 摘要（表面省下 $\Delta T_{\text{saved}} = 75\text{K}$），但切点之后保留了 $T_{\text{suffix}} = 70\text{K}$ 的近期消息。由于注意力掩码的位置编码与精确字节前缀匹配规则，**切点后 $70\text{K}$ 消息的 KV Cache 在下一轮全部失效**：
 
-### 单份存储 + 零拷贝（关键设计）
+1. **回溯尾税（Suffix Shift Penalty）**：下一轮立刻多交 $70\text{K} \times (\$0.15 - \$0.003)/\text{M} = \$0.0103$；
+2. **压缩器自身开销（Compressor Tax）**：若调用 LLM 生成摘要，还需额外支付一次输入与高价输出（`$0.60/M`）；
+3. **每轮微薄回本（Per-Turn Cache Saving）**：省掉 $75\text{K}$ 已缓存前缀，每轮仅省 $75\text{K} \times \$0.003/\text{M} = \$0.000225$——**至少要连续无变动再跑 $46$ 轮才能收回一次压缩的尾税！**
 
-```
-ContentStore  每个 payload 在 ingestion 时只写一次，键 <blockId>@v<version>，
-              落盘 runs/<ts>/content/。artifact://<key> 是唯一恢复通道。
-Journal       append-only：ingest / patch / llm_call，只记元数据与内容键，从不复制全文。
-```
+由此导出 CPAT 的核心架构铁律——**零后缀偏移定律（Zero-Suffix Shift Law）**：
 
-推论：**`payload_offload` 退化为零拷贝视图翻转**——payload 已在 ContentStore 当前版本键下，
-offload 只把 block 的 `content` 从 inline string 换成指向该键的 `ArtifactRef`，瞬时完成；
-`restore` 是逆操作，把全文从该键读回填为 inline。两者都不改 version、不改 kind、不破链。
+> **任何上下文缩减操作，要么发生在字节进入 KV Cache 之前（Write-Time Pre-Cache），要么发生在当前轨迹的最末端边界（令受影响后缀 $T_{\text{suffix}} \equiv 0$），要么发生在窗口硬上限的纪元换代点并直接派生复用温热前缀。**
 
 ---
 
-## 3. 工具契约：agent 看到的 schema
+## 2. 三层 Cache-First 生产架构（`extensions/pi-cpat.ts`）
 
-`context_update`（`src/agent/contextTool.ts`）。顶层 `{reason, operations[]}`，`operations` 每项是
-**扁平的 per-op item**（OpenAI strict-mode 友好），由唯一翻译层 `parseContextUpdateArgs` 归一化成
-typed `ContextOperation` 联合类型，再交给 patch 引擎。
+CPAT 在宿主生命周期的四个精确钩子（`tool_result`、`before_agent_start`、`before_provider_request`、`session_before_compact`）上构建了互不干扰的三道防线：
 
-设计要点：
+### 2.1 Layer 1：入窗前超大 `tool_result` 门控与宿主截断恢复（`src/sidecar/tool-projector.ts`）
 
-- **schema 即契约**：每个字段的 description 明确说明"哪个 op 用、效果是什么"。tool description 顶部给出
-  **操作选择指南**（按可逆性/代价升序：`set_visibility=archived` < `payload_offload` < `restore` <
-  `compact`/`fold`/`merge`），以及"处置陈旧块"（摘要已含事实就 hidden 掉冗余源）和"读完即 offload"的里程碑策略。
-- **空 `operations: []` = 显式 no-op**：用于边界 pass 决定"不值得改写上下文"。
-- 辅助工具 `artifact_get`：按 `artifact://<key>` 取回 offload 全文（恢复通道）。
+当工具调用完成、尚未拼入下一轮 LLM 请求时，`pi.on("tool_result")` 立即执行同步（`<3ms`、`$0` LLM 成本）检查：
 
----
+1. **宿主静默截断全量恢复（Blind-Spot Recovery）**：
+   - Pi 内置 `bash` 默认在 `50KB / 2,000 行` 处执行**尾截断**（丢弃首屏编译报错/首个失败用例），并将完整输出写入临时文件 `event.details.fullOutputPath`；CPAT 自动读取该完整文件（上限 8 MiB 安全阈值）。
+   - Pi 内置 `read` 默认在 `50KB / 2,000 行` 处执行**头截断**（`event.details.truncation.truncated === true`）；CPAT 自动从磁盘源文件补齐完整行，并记录精确 `baseLineOffset`（例如 `read(path, offset=100)` 的第 43 行映射为真实文件行 `L142`）。
+2. **100% 全量无损建索引**：
+   - 恢复后的完整原文写入 `SearchIndex`（内存窗口 BM25 + 正则 + 真实行号切片）与本地快照目录 `raw-index/<blockId>.txt`。
+3. **信息熵感知门控（Entropy-Aware Gate）**：
+   - 采样最多 400 行掩码归一化（剥离数字、十六进制地址、Hash、时间戳）计算行模板冗余度 `redundancyRatio`；
+   - 满足以下任一条件即触发入窗前投影：
+     - 宿主已发生截断且全量 `>= 3,500` tokens（`host_truncated_recovery`）；
+     - 代码/Shell 工具（`bash`/`read`/`grep`/`find`/`ls`）单次输出 `>= 24,000` tokens（`coding_or_shell_oversized`）；
+     - JSON 导出或高重复日志（`redundancyRatio >= 0.36`）单次输出 `>= 28,000` tokens（`high_redundancy_dump`）；
+     - 任意工具单次超过绝对内联上限 `96,000` tokens（`hard_cap_exceeded`，确保 `<96K` 的高密度自然语言长文/小说能无损直通 KV Cache）。
+4. **高信号确定性投影结构**：
+   - 按工具形态输出专用紧凑视图（`~800–1,400` tokens）：
+     - `grep/rg`：按文件聚合命中计数 + 每文件前 3 条行号预览；
+     - `JSON`：顶层 Schema / 数组长度 + 首尾样本记录；
+     - 代码与测试日志：首部 18 行 + **全文 `Lstart-Lend` 函数/类符号跨度表**（`extractCodeSymbolSpans`）+ **跨全文扫描提取的 `ERROR / Traceback / AssertionError` 诊断块** + 尾部 20 行退出摘要。
 
-## 4. 8 个原子操作（目前提供的能力）
+### 2.2 Layer 2：显式任务边界与历史错误假设折叠（`ScopeTree` + `AC3`）
 
-默认启用 6 个；`replace` / `redact` 默认 gated。
+针对会话尚未撞击 `384K` 上限（如仅 `60K–150K`），但前序探索走入死胡同留下大量错误推理定势（Context Pollution）或完成独立子任务的场景，CPAT 将 `ScopeTree`（`src/runtime/tree.ts`）与 **`AC3` 第一阶段权威源隔离原则**接入三种显式边界触发器：
 
-### 4.1 `set_visibility` — 最便宜、最可逆
-park 或恢复整块，不改内容。`archived` 留 manifest 可恢复；`hidden` 彻底移出；`model` 恢复。
-**首选**——处置不再需要但可能回访的块。
+1. **Agent 主动提交边界（`context_checkpoint` 工具）**：
+   - Agent 仅在子任务阶段完结（`mode: "subtask_complete"`）或确认前序假设证伪（`mode: "pollution_purge"`）时调用，声明 `verified_facts` 与 `purged_assumptions`。
+   - 当前回合结束（`turn_end`）时，CPAT 将上一个锚点 `lastFoldAnchorEntryId` 与当前回合之间全部中间态 `assistant` + `toolResult` 成对链条发出原生持久 `context_edit(targetId, null)` 折叠，仅保留用户原始提问与 `[cpat:scope_checkpoint #scope_N]` 洁净结论块。
+2. **用户显式纠偏 / 切新需求边界（`before_agent_start`）**：
+   - 在新用户消息落盘前识别显式边界标签（`[TASK_BOUNDARY]` / `[RESET_CONTEXT]`）或中英文纠偏/切题指令（如 `"Ignore the previous hypothesis..."`、`"前面的假设错了..."`、`"切新需求：..."`）。
+   - **严格执行 `AC3` 权威源隔离**：生成的 `[cpat:scope_checkpoint]` **物理排除全部旧 Assistant 文本**（零幻觉残留），仅列出已入库工具原件的客观地标（`#b_001..#b_k` 文件路径与符号行号）；首轮通过 `context` 即刻剥离旧污染链，并在首轮 `turn_end` 持久化为 `context_edit(targetId, null)`，保证新阶段 Turn 1 与 Turn 2 拥有 **100% 字节一致的前缀**！
+3. **交互式手动命令（`/cpat-fold`）**：
+   - 用户在终端随时输入 `/cpat-fold [备注]` 即可在下一轮提问边界执行零后缀栈帧折叠。
 
-### 4.2 `payload_offload` — 大载荷外置（零拷贝）
-把大 `tool_result` / `assistant_message` 的原文换成"短摘要 + artifact 引用"。摘要里要放**精确事实**
-（名/数/ID/code 逐字）和 `retrieval_hint`。token 大幅下降，全文经 `restore` / `artifact_get` 可恢复。
+### 2.3 Layer 3：`384K` 同源前缀派生摘要（Cache-Forked Epoch Summary）+ 多纪元无损目录
 
-### 4.3 `restore` — offload 的逆操作（零拷贝）
-把已 offload 块的全文从 ContentStore 回填为 inline。version 不变、kind 不变、不破链。
-比"重读源文件"便宜——但前提是信息源在 context 里那一份是唯一的（见 §7 局限）。
+当超长多代会话（如 `500K → 2M → 10M` tokens）真正跑满窗口高水位（`384K`）触发 `session_before_compact` 时：
 
-### 4.4 `compact` / `fold` / `merge` — 把多块收敛成一块（有损但可恢复）
-三者共享实现路径 `collapseIntoBlock`：归档源块 + 在最早源块位置插入一个 summary 块。区别在语义与校验：
-
-| op | 适用 | 额外约束 |
-|---|---|---|
-| `compact` | 任意一组完成的探索 | 必须声明 `preserve`（保精确事实）/ `drop`（弃 filler） |
-| `fold` | 一段**连续**子任务轨迹 | ids 必须在 block order 连续；需 `scope_label` |
-| `merge` | 2+ 重叠/重复块（如同文件读两次） | ≥2 个 id；`resolution` = update / contradiction |
-
-源块被 archive（可恢复），所以视图有损但信息可找回。summary 块是一等块（可被再压缩，形成层级摘要）。
-
-### 4.5 `replace` / `redact` — gated 改写
-`replace` 改写非 protected 块内容；`redact` 删 inline JSON tool_result 的字段。默认关闭
-（`--allow-replace` / `--allow-redact`），MVP 阶段"历史不可重写"策略。
-
----
-
-## 5. 事务引擎：怎么实现校验与应用
-
-`applyContextUpdate`（`src/runtime/patch.ts`）。**事务语义**：对 block store 的克隆副本（`staged`）逐 op 校验，
-**任一 op 被拒则整体不提交**，全部 rejection 返回 agent 重试。
-
-### 5.1 通用前置门
-`unpatchable`：`system_prompt` / `budget_report` / `api_required` 块一律拒（`protected_kind`）——
-runtime-owned，agent 不可碰。
-
-### 5.2 全部 27 条校验规则
-| 类别 | 规则 |
-|---|---|
-| 通用 | `empty_ids` · `unknown_id` · `protected_kind` |
-| compact | `compact_output` · `compact_policy` · `hidden_target` |
-| offload | `offload_replacement` · `offload_kind` · `already_offloaded` |
-| restore | `not_offloaded` · `artifact_missing` |
-| merge | `merge_output` · `merge_arity` · `merge_resolution` |
-| fold | `fold_output` · `fold_scope` · `fold_range` |
-| set_visibility | `visibility_missing` · `protected_hidden` |
-| replace | `op_disabled` · `replace_protected` · `replace_content` |
-| redact | `op_disabled` · `redact_fields` · `redact_kind` · `redact_not_json` |
-| **护栏** | `protected_state` · `protected_current_question` · `chain_atomicity` |
-
-### 5.3 两个关键护栏（实现正确性的命门）
-
-**`chain_atomicity`（事务级后置检查）**：tool-call chain = assistant 头 + 它全部的 tool_result
-（含已 offload 的）。链归属看 `api.tool_call_id`/`api.tool_calls`，**不看 kind**。若 patch 后链中任一成员
-不再可见，整体拒绝——否则下一轮 API 会收到孤立的 `role:"tool"` 消息而返回 400（这是真实回归，由 test 守护）。
-
-**`protected_state` / `protected_current_question`（语义漂移护栏）**：`compact`/`fold`/`merge` **不能吞掉**
-`task_state` 块和**当前问题**（block order 里最后一个 `user_message`）。没有这个护栏时，实测 agent 会把当前问题
-压进摘要、然后回复"没收到问题"（语义漂移）。这是研究中诊断出的真实失败，加护栏后准确率从 90% → 100%
-（见 [`research/experiments/03-smoke-v3-active-vs-passive.md`](https://github.com/TokenRollAI/CPAT/blob/main/research/experiments/03-smoke-v3-active-vs-passive.md)）。
-
-### 5.4 提交
-校验通过后：version 增长的写新 content 键，`Object.assign` 落回真实 block；暂存的 summary 经
-`store.create` + `insertAfter` 正常 ingestion。`freed_tokens` = 提交前后可见 token 之差。
+1. **只读捕获温热线路请求（`before_provider_request`）**：
+   - 每轮请求发出前只读记录 `lastWireRequest = { model, tools, messages }`（返回 `undefined`，零侵入）。
+2. **同源前缀派生摘要请求（`runCacheForkEpochSummary`）**：
+   - 撞线瞬间，复用刚在服务端温热的 `model + tools + messages` 完整前缀数组，仅在最末尾追加一条 `<250` tokens 的跨纪元因果账本归纳指令（附带 `previousSummary` 跨纪元接力与最近 1 轮增量 `tailDelta`），直连 `/chat/completions`（`max_tokens: 900`, `stream: false`）。
+   - 因为前 `~360K–380K` tokens 与几秒前的主会话请求**逐字节 100% 一致**，该摘要调用直接享受 **95%+ KV Cache 命中率**（输入成本仅 $380\text{K} \times \$0.003/\text{M} \approx \$0.0011$，而非冷启动的 $\$0.057$）！
+   - 若冷启动恢复会话尚无 `lastWireRequest`，自动降级为 `$0.0000`、`<5ms` 的纯确定性结构骨架目录，绝不误付冷缓存全价。
+3. **多纪元无损目录防膨胀压缩（`buildMultiEpochBlockDirectory`）**：
+   - 最近 40 个块展示完整描述、文件符号行跨度与章节头；更早纪元的块按每 25 块自动聚合为一行纪元范围索引（如 `Earlier Epoch Range #b_001..#b_025`），使连续换代 10–20 次（`5M–10M+` tokens）后检查点体积仍恒定控制在 `<3.5K` tokens，同时 `#b_001..#b_300` 每一个块都能通过 `context_query` 精准寻址。
 
 ---
 
-## 6. 与 runtime 的协作
+## 3. 独立 `ContextHarness` 架构（`src/harness/` + `src/sidecar/`）
 
-`context_update` 不是孤立工具，它嵌在一个预算监控循环里（`src/runtime/runtime.ts`、`src/agent/loop.ts`）：
+在不依赖 Pi 宿主的自有 Agent 场景（`src/cli.ts --mode harness` 或编程嵌入 `ContextHarness` 类）中，CPAT 提供完整的多分辨率上下文编译与主从异构套利管线：
 
-- **压力阶梯**（按下一轮 view 的校准估算）：70% soft → 80% must_act → 95% critical。
-- **critical 兜底**：runtime 强制 offload 最大的 inline tool_result（≥300 token）——语义上"笨"
-  （最大优先、不懂哪些重要），所以好的治理应更早发生。`runtime_fallback_offloads` 占比高 = agent 治理不及时。
-- **边界维护 pass**：一个 followup 问题进入后，runtime 给 cpat 一次只允许 `context_update` 的 ephemeral pass。
-- **缓存友好**：消息列表 = block 顺序（稳定前缀），manifest/budget_report 集中在易变尾部、不落为长期 block。
-
----
-
-## 7. 已验证的价值与已知局限
-
-**验证**（受限窗口、自建深度研究任务、三臂双扫，详见 [`research/experiments/04-full-double-sweep.md`](https://github.com/TokenRollAI/CPAT/blob/main/research/experiments/04-full-double-sweep.md)）：
-- 受限窗口下，治理（CPAT 或 threshold）让 ReAct 从 0-8%（提前终止）→ 100%。
-- 200K 窗口下，主动 CPAT 用 1/5.8 的 token 达到与被动 threshold 相同的 100%（省 83%）。
-
-**局限（诚实记录）**：
-- 32K 小窗口下，CPAT 主动治理的 LLM 往返开销 > 节省，比 threshold 更贵——大窗口才回本。
-- `restore` 的独立价值未验证：静态文件可重读时，agent 永远选 re-read 而非 restore。restore 的价值场景是
-  **信息源不可重得**（一次性工具输出、推理中间态）。
-- prompt-only 主动治理有架构开销瓶颈（每次治理一次 LLM 往返），印证 CAT 论文用 SFT 训练让治理零往返融入推理的必要性。
+1. **四档多分辨率块（Multi-Resolution `ContextBlock`）**：
+   - `full`（完整内联）$\leftrightarrow$ `digest`（异步廉价旁路模型 `ShadowDigester` 预提取的结构化 `FactDigest`）$\leftrightarrow$ `skeleton`（`<2ms` 确定性结构骨架）$\leftrightarrow$ `landmark`（单行地标）。切换分辨率仅翻转 `active_resolution` 指针，零拷贝、不改 `kind`、不破坏 `tool_call_id` 配对。
+2. **L0–L4 严格前缀对齐视图编译器（`src/runtime/view.ts`）**：
+   - 移除传统动态插入头部的易变清单，确保非压缩回合消息字节流 100% 严格只增不改。
+3. **白盒两级 `DecisionEngine` + `EconomicCommitGate`（`src/sidecar/decision.ts`, `src/harness/cost.ts`）**：
+   - 先经 `<1ms` 水位迟滞门控与缓存经济净收益公式验算（拦截回溯尾税大于预期收益的负优化折叠），再按需执行批量降级或 `AC3` 两阶段隔离污染清洗。
 
 ---
 
-## 8. 扩展指南：怎么加一个新 op
+## 4. 底层事务式 Patch 引擎与 27 条正确性护栏（`src/runtime/patch.ts`）
 
-1. **`src/types.ts`**：在 `ContextOperation` 联合类型加新 op 的形状。
-2. **`src/agent/contextTool.ts`**：在 schema 的 `op` enum 加名字 + 相关字段的 description；在 `parseContextUpdateArgs`
-   加扁平→typed 的归一化分支。
-3. **`src/runtime/patch.ts`**：在 `applyContextUpdate` 的 switch 加 case；复用 `collapseIntoBlock`（若是收敛类）
-   或写新逻辑；加校验规则（用 `reject(i, "rule_name", msg)`）。
-4. **守护不变量**：若触及 tool-call chain 或对话状态，确认 `chain_atomicity` / `protected_*` 护栏覆盖。
-5. **测试**：在 `test/patch.test.ts` 加正反向用例（参考 restore/merge/fold 的测试）。`npm test` 必须全过。
-6. **文档**：更新本文 §4 + [`llmdoc/architecture/context-runtime.md`](https://github.com/TokenRollAI/CPAT/blob/main/llmdoc/architecture/context-runtime.md) §4 规则表。
+无论是 v1 模型前台自调 `context_update` 工具，还是 v2 `ContextHarness` 内部提交状态变更，底层统一经由 `applyContextUpdate` 克隆副本事务引擎执行：**任一操作违反护栏则整批原子回滚**。
 
-> 设计原则：新 op 应尽量复用"归档源块 + 建 summary"或"零拷贝翻转"路径，**不碰 `ContextBlock` 数据模型**。
-> 触及数据模型的扩展（如 supersede 需 resource_key、set_retention 需 TTL）应先讨论再实现。
+### 4.1 单份内容存储（`ContentStore`）与审计日志（`Journal`）
+- **`ContentStore`**：每个载荷在摄入时按 `<blockId>@v<version>` 落盘一次；`payload_offload` 与 `restore` 均为零拷贝引用翻转。
+- **`Journal`**：append-only 记录每次 `ingest` / `patch` / `scope` / `sidecar` 事件与内容键，支持完整离线重放与成本归因。
+
+### 4.2 核心协议与语义护栏
+
+| 护栏类别 | 规则代号 | 守护的不变量 |
+| :--- | :--- | :--- |
+| **API 协议完整性** | `chain_atomicity` | `assistant(tool_calls)` 与其全部配对 `tool_result` 必须同见同隐，彻底杜绝孤立 `role: "tool"` 引发的 OpenAI/DeepSeek HTTP 400 |
+| **系统与权威状态保护** | `protected_kind` · `protected_state` | `system_prompt`、`budget_report`、`task_state` 及 `api_required` 思维链在开启期间禁止被篡改或隐藏 |
+| **防语义漂移护栏** | `protected_current_question` | 禁止 `compact` / `fold` / `merge` 吞并最后一条当前用户提问（消除压缩后“忘记当前在答什么”的退化） |
+| **结构与可恢复性校验** | `compact_policy` · `fold_range` · `artifact_missing` | 强制 `compact` 显式声明 `preserve`/`drop`，强制 `fold` 仅作用于连续块区间，校验恢复键存在性 |

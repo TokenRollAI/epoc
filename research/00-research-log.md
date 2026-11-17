@@ -171,3 +171,70 @@ v3b 重跑 cpat 检验护栏效果。
 - 相对 threshold：大窗口下巨大成本优化（省 83%），质量打平。
 
 **研究目标达成**：跑出了对 CPAT 有实际价值的 case（强价值，非边际）。
+
+---
+
+## 阶段 7：演进为独立 `ContextHarness` 基础设施（廉价模型 Sidecar + 白盒 Decision，2026-11-16）
+
+### 动机：攻克阶段 5/6 遗留的两大公开局限
+1. **小窗口往返税倒挂**：阶段 6 中 32K 小窗口下 `cpat` v1 因主模型频繁自调 `context_update`，总耗费反比被动 `threshold` 高 52%。
+2. **写时主观丢弃与不可重读信息源盲区**：静态文件可重读时 `restore=0`；一旦换成一次性不可重读工具流，写时主动 `hidden` 处置陈旧块会误删未来追问所需的细粒度字面事实。
+
+### 架构升级（`src/harness/` + `src/sidecar/` + `src/runtime/tree.ts,index.ts`）
+结合 2026 年前沿范式（Scroll、Spine、ContextPilot、MEMENTO、acp-kernel、Self-GC、Rivet、AC3），将上下文管理从“寄生于主模型推理回合的单工具”解耦为独立 **`ContextHarness`**：
+- **定义 Context**：L0–L4 严格前缀对齐编译视图 + `ScopeTree` 任务栈帧 + 四档多分辨率块（`full` / `skeleton` / `digest` / `landmark`）+ 认识论权限分级（`authoritative` / `observation` / `subjective`），移除每轮 `<context_manifest>` 伪用户消息以保持 100% 字节前缀连续性。
+- **定义 行为**：写入时同步建立零依赖 `SearchIndex`（行级 + Regex + 窗口 BM25）并异步触发廉价模型 `ShadowDigester`（`deepseek-flash`, `reasoning_effort="low"`）；回合前由两级白盒 `DecisionEngine`（Tier-1 快速门控 + `EconomicCommitGate` 缓存净收益核算 + Tier-2 战术判别 + `AC3` 物理隔离污染清洗）零往返税完成批量降级；读取时由 `SubReader` 响应 `context_query` 做精准行级投影。
+- **定义 效果与成本**：五维效果指标 + `CostTracker` 真实缓存折后美元账本（区分主模型 `hit`/`miss`/`out` 与旁路 `sidecar` 全量开销）。
+
+### 决定性实证结果（详见 [`experiments/05-context-harness-eval.md`](experiments/05-context-harness-eval.md)）
+1. **三套专用数据集（`bounded-research` 32K / `ephemeral-stream` 不可重读流 / `pollution-spec` 污染覆写，共 12 题）同构 `deepseek-flash` 四臂全量横评**：
+   - 总准确率：`react` **16.7%**（全爆窗） / `threshold` **58.3%** / `cpat` v1 **75.0%** / **`harness` v2 100.0%（12/12 唯一满分）**。
+   - 在一次性不可重读流 `ephemeral-stream` 上，`threshold`（无恢复通道）与 `cpat` v1（写时认为追踪表是噪声将其 `hidden`）在深埋 `TRC-...` 针式召回上双双 **0%**（总分 25%）；`harness` 达成 **100%（4/4）** 且墙钟速度比 `cpat` v1 快 **3.2×**。
+   - 在 32K `bounded-research` 上，`harness` 缓存命中率达 **81.6%**（四臂最高），总成本比 `cpat` v1 **直降 64.1%**。
+2. **主从异构模型套利验证（Main `deepseek-v4-pro` + Sidecar `deepseek-flash`）**：
+   - 在 15K 极小窗口 `bounded-research` 上，三臂均 100% 准确率，但 **`harness` 仅用理论极限 4 轮、真实总成本 $0.0195**，不仅比 `cpat` v1（$0.1332）**暴省 85.4%（便宜 6.8×）**，更首次在小窗口正面击败被动 `threshold`（$0.0287，**省 32.1%**），彻底闭合阶段 6 遗留缺口。
+
+---
+
+## 阶段 8：v2.1 迟滞批量消化打磨 + 三大公开 Benchmark 验证（2026-11-16）
+
+针对阶段 7 暴露的摩擦点落地三项升级（按需多块打包 `digestBatch`、默认 `query_only` 极简工具面、**GC 高低水位迟滞门控**与停用词感知检索），并接入三大第三方公开基准（[`bench/public-bench.ts`](../bench/public-bench.ts)，详见 [`experiments/06-public-benchmarks-v2-1.md`](experiments/06-public-benchmarks-v2-1.md)）：
+
+- **`bounded-research` (32K) 复测**：即使面对主模型单轮并发读取全部 14 篇档案（~70K tokens）的极端冲击，v2.1 零阻塞完成降级，主模型轮次 `13 → 11`、Prompt Tokens **`97.5K → 69.5K`（再降 28.8%）**、缓存命中率 **`82.4%`**、准确率 **100%**。
+- **`LongMemEval-S`（真实 50+ 轮 ~110K 会话流 / 32K 窗口）**：`react` 100% 爆窗（50%），`cpat` v1 因治理挤占步数未读完会话（50%，$0.1534）；`harness` v2.1 拿到 **100%**，GC 迟滞门控将缓存命中率从 `30.6%` 推升至 **`58.6%`**，总成本降至 **$0.1262（比 v1 省 18%、快 1.6×）**。
+- **`MemoryAgentBench`（单向增量块摄取 / 26K 窗口）**：`react` 爆窗仅 **12.5%**；`harness` v2.1 以最低峰值水位（`14.8K`）和 `62.2%` 缓存命中率，比 `cpat` v1 **省 62% 主模型 Prompt Tokens、省 39% 总成本、快 2.2×**。
+- **`ContextBench Verified`（真实检出 `astropy` / `django` 历史 Commit / 24K 窗口）**：`react` 在 `astropy` 上爆窗；被动 `threshold` 虽找对文件但丢掉行号导致 **`Utilized Line F1` 崩塌至 `12.9%`**；`harness` v2.1 全程零爆窗、保持 **`78.8%` 最高缓存命中率**，行级定位 `Line F1` 达 **`41.2%`（`threshold` 的 3.2 倍、`cpat` v1 的 1.4 倍）**。
+
+---
+
+## 阶段 9：接入真实 `Pi CLI` 宿主、对标 `billion-context` 与 400K `Cache-First Lazy` 架构跃迁（2026-11-17）
+
+将 CPAT 封装为原生 Pi 插件（[`extensions/pi-cpat.ts`](../extensions/pi-cpat.ts)，`pi -e ./extensions/pi-cpat.ts`），在真实 `Pi CLI v1.5.2` + `deepseek-flash` **400K 窗口（50:1 缓存价差：`$0.15/M` vs `$0.003/M`）** 下正面对标官方 `billion-context v0.1.216` 与 `pi-native`（[`bench/pi-billion-bench.ts`](../bench/pi-billion-bench.ts)，详见 [`experiments/07-pi-400k-cache-first-vs-billion-context.md`](experiments/07-pi-400k-cache-first-vs-billion-context.md)）：
+
+- **第一性原理反转发现**：在 `50:1` 缓存折扣下，高频中段折叠（如 `billion-context` 50K 步频与 CPAT 48K 滑动步频）因反复使切点后尾巴缓存失效，总成本反比不改前缀的 `pi-native` 贵 30%–80%；而 `pi-native` 的唯一短板是跨过 `384K` 撞线时将工具输出硬截断为 2,000 字符（`LongMemEval-S` 准确率跌至 `50%`）。
+- **`Cache-First Lazy` 合体（默认策略）**：`0 → 384K` 零字节改动纯追加锁死前缀缓存（`$0` 旁路费，仅在内存 `<1ms` 同步建 `SearchIndex` 与代码 `Lstart-Lend` 符号表），仅在撞线瞬间以 `$0` 确定性结构目录 + 无损 `context_query` 接管 `session_before_compact`：
+  - **`LongMemEval-S` (~510K)**：**`100%` Judge Acc**（`pi-native` 50%），Cache 命中率 **`77.9%`（全场最高，较 48K 步频 +60.8pp）**，成本 **`$0.0719`（紧贴 `pi-native` 地板价 `$0.0699`，较 `billion-context` `$0.1276` 省 43.7%、快 1.76×）**。
+  - **`MemoryAgentBench AR` (~502K)**：**`100%` EM**（`billion-context` 83.3%），Cache 命中率 **`82.6%`（全场最高）**，成本 **`$0.0621`（较 `billion-context` `$0.1084` 省 42.7%、快 2.19×）**。
+  - **`ContextBench`（连续三仓库单会话）**：**`33.4%` Utilized Line F1（全场第 1，`billion-context` 21.8%、`pi-native` 15.8%）**，Cache 命中率 **`95.4%`**。
+
+---
+
+## 阶段 10：三层 `Cache-First v3` 完整形态落地——入窗前门控 + 同源派生摘要 + 显式污染边界折叠（2026-11-17）
+
+针对阶段 9 纯懒压缩剩余的三个真实工程痛点，在 `extensions/pi-cpat.ts` 与 `src/sidecar/tool-projector.ts` 完成三层零回溯偏移闭环（42/42 离线测试全绿，详见 [`experiments/08-cache-first-v3-upgrades-and-400k-benchmarks.md`](experiments/08-cache-first-v3-upgrades-and-400k-benchmarks.md)）：
+
+1. **Layer 1 — `tool_result` Pre-Cache 入窗前门控（击穿首轮未命中税地板）**：
+   - 在超大/低熵工具输出进入主模型与 KV Cache **之前**即转存 `SearchIndex` 并返回高信号骨架，同时从 `details.fullOutputPath` 与源文件自动恢复宿主 50KB / 2,000 行截断盲区。
+   - 实测将 `LongMemEval-S` (~600K) 缓存命中率推至 **`90.9%`（全场第 1）**、总账单压至 **`$0.0087`（较 `pi-native` `$0.0695` 便宜 8.0×，较 `billion-context` `$0.1506` 便宜 17.3×）**；`MemoryAgentBench AR` (~502K) 账单压至 **`$0.0067`（便宜 9.0×–16.8×）**；`oversized-tools` 两轮 100% 满分且成本全场最低（`$0.0021` / `$0.0099`，而 `billion-context` 在第二轮跌至 `0%`）。
+2. **Layer 2 — 显式任务/污染边界 `ScopeTree` + `AC3` 零后缀栈帧折叠**：
+   - 支持 `context_checkpoint` 工具、`/cpat-fold` 命令与用户显式纠偏/切新任务识别，在 `suffixCachedTokens == 0` 处清洗错误推理定势。
+   - 在 `pollution-boundary`（Phase 1 注入 ~54K 废弃 v1 规范 → Phase 2 切 v3 合约）中，Phase 2 活跃窗口直降 **`82.3%–88.3%`**（`53.8K → 3.1K` 起步、峰值仅 `9.5K`），总 Prompt 减半至三分之一，无污染准确率 **100%**。
+3. **Layer 3 — `384K` 同源前缀派生摘要（Cache-Forked Epoch Summary）+ 120 题全子任务（480 题次）终局验证**：
+   - 通过 `before_provider_headers` + `before_provider_request` 完整透传 `rawPayload`（含 `thinking` 模板参数）与 `x-session-affinity` 亲和头，在 `LongMemEval-S` 全部 10 组跨 `384K` 马拉松上实测拿到 **`99.8%` 派生摘要 KV Cache 命中率（10 次 ~360K 摘要合计仅花 `$0.0173`）**。
+   - **120 题四臂终局成绩单**（`LongMemEval-S` 40 题 + `MemoryAgentBench` 40 题含 `1.48M TTL` + `ContextBench` 9 仓 30 题 + 专项 10 题）：**`cpat` 以 `67.9%` 宏平均 / `63.2%` 加权总分夺得效果全场第 1**（`billion-context` `65.0%` / `59.1%`，`pi-native` `58.5%` / `50.4%`，`full` `40.1%` / `26.5%`），同时 **120 题全链路总账单仅 `$1.3250`（在全部存活臂中成本最低：比 `billion-context` `$2.5285` 省 `47.6%`，甚至比不做任何治理的 `pi-native` `$1.4760` 还省 `10.2%`！）**。
+
+---
+
+## 阶段 11：正式定名 `epoc`（Epoch Context）与六宿主统一工程化蓝图（2026-11-17）
+
+随着第 1–10 阶段实证彻底否定“中途给上下文打补丁（Context Patch as Tool）”路线，项目正式由研究代号 `CPAT` 更名为 **`epoc`（Epoch Context / Epoch-Paged Optimal Context）**，远程 GitHub 仓库迁移为 `TokenRollAI/epoc`，并在 [`../ROADMAP.md`](../ROADMAP.md) 完成面向 **`codex`（含 ChatGPT 订阅 OAuth）· `claude code` · `agy` · `kimi` · `pi` · `dsh`** 六大宿主的统一 CLI、确定性影子账本（`ShadowLedger`）本地多协议网关与轻量 `epoc-mcp` 工程化蓝图。

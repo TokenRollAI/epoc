@@ -1,6 +1,6 @@
 # llmdoc 索引
 
-CPAT 项目文档全局地图。启动必读顺序见 `llmdoc/startup.md`。
+`epoc`（Epoch Context，前身原型 `CPAT`）项目文档全局地图。启动必读顺序见 `llmdoc/startup.md`。
 
 ## must/ — 每次任务必读
 
@@ -33,6 +33,8 @@ CPAT 项目文档全局地图。启动必读顺序见 `llmdoc/startup.md`。
 - `memory/decisions/0005-cpat-value-requires-superwindow-scale.md`：CPAT 价值验证须在「超工作窗口规模 + 信息不可 grep 跳过 + 有回访模式」场景下进行；核心可测能力是 offload→restore 可逆吞吐。longloop 25 万实验坐实 V4 Pro 百万窗口下无法构造该场景。
 - `memory/decisions/0006-reposition-cpat-as-cost-optimization.md`：五组实验后把 CPAT 重新定位为上下文成本优化策略(省 token 35-57%)而非任务质量提升策略;**2026-06-25 由 0007 部分推翻——仅在非受限窗口语境成立**。
 - `memory/decisions/0007-bounded-window-cpat-value.md`：受限窗口范式修正（推翻 0006 的一半）。全量双扫（硬窗口 32K/200K × react/threshold/cpat）证明：治理>不治理两窗口成立（react 0%/8.3% → 治理 100%）；200K 下主动 CPAT 省 83% token 碾压被动 threshold。诚实标注 32K 下 cpat 反更贵、restore 仍未验证。
+- `memory/decisions/0008-independent-context-harness.md`：演进为独立 `ContextHarness` 基础设施（`ScopeTree` + 四档多分辨率块 + 异步廉价模型 `ShadowDigester` + 两级白盒 `DecisionEngine` + 无损倒排 `SubReader` + 真实缓存成本账本），在三套专用数据集四对照臂实测中达成唯一 100%（12/12）满分并攻克 32K 成本倒挂与不可重读流召回两大历史缺口。
+- `memory/decisions/0009-epoc-v3-and-multi-host-packaging.md`：Cache-First v3 在 400K 窗口 120 题四臂实测夺得准确率与最低成本双第一（`67.9%` / `$1.3250`、派生摘要 `99.8%` 缓存命中）；正式更名为 `epoc`（Epoch Context），确立 `ShadowLedger` 确定性影子账本与 `codex`（ChatGPT 订阅）/ `claude code` / `agy` / `kimi` / `pi` / `dsh` 六宿主接入蓝图。
 - `memory/doc-gaps.md`：已知文档/实验缺口与闭合标准。
 - `memory/reflections/`：reflector 维护。
   - `2026-06-13-agent-passive-under-pressure.md`：H1 失效模式实证——agent 在 must_act 压力下不主动 patch，全靠 runtime 兜底。
@@ -41,7 +43,7 @@ CPAT 项目文档全局地图。启动必读顺序见 `llmdoc/startup.md`。
 
 ## 根目录文档
 
-- `README.md`、`ARCHITECTURE.md`（项目根，非 llmdoc）。其中 `ARCHITECTURE.md` 详解 `context_update` 工具的设计与实现，可作为 `must/core-concepts.md` 与 `architecture/context-runtime.md` 的面向读者补充。
+- `README.md`、`ARCHITECTURE.md`、`ROADMAP.md`（项目根，非 llmdoc）。其中 `ARCHITECTURE.md` 详解三层 Cache-First 架构与上下文引擎实现，`ROADMAP.md` 详述 `epoc` 六宿主统一 CLI、本地网关与 MCP 工程化实施方案。
 
 ## 约定
 

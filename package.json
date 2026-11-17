@@ -1,7 +1,7 @@
 {
-  "name": "cpat",
+  "name": "epoc",
   "version": "0.1.0",
-  "description": "CPAT — Context Patch as Tool. Agent-driven context maintenance protocol, prototyped on DeepSeek.",
+  "description": "epoc (Epoch Context) — Epoch-paged, prefix-cache-first context engine for long-horizon coding agents (formerly prototyped as CPAT).",
   "type": "module",
   "private": true,
   "engines": {
@@ -12,8 +12,17 @@
     "tui": "node src/cli.ts tui",
     "demo": "node src/cli.ts run --demo",
     "bench": "node bench/deepresearch.ts",
+    "bench:harness": "node bench/harness-suite.ts",
+    "bench:public": "node bench/public-bench.ts",
+    "bench:pi": "node bench/pi-billion-bench.ts",
+    "bench:pi-120": "node bench/pi-scale2-bench.ts",
     "test": "node --test test/*.test.ts bench/*.test.ts",
     "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-cpat.ts"
+    ]
   },
   "devDependencies": {
     "@types/blessed": "^0.1.27",
