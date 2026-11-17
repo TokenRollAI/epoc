@@ -1,5 +1,14 @@
-import type { ChatUsage, CpatConfig, ToolCall, ToolDefinition } from "../types.ts";
-import { DeepSeekClient } from "../deepseek/client.ts";
+import type {
+  ChatUsage,
+  CostBreakdown,
+  CpatConfig,
+  HarnessMode,
+  ToolCall,
+  ToolDefinition,
+} from "../types.ts";
+import { type ChatClient, DeepSeekClient } from "../deepseek/client.ts";
+import { CostTracker, pricingForModel } from "../harness/cost.ts";
+import { ContextHarness } from "../harness/harness.ts";
 import { ContextRuntime } from "../runtime/runtime.ts";
 import {
   artifactGetTool,
@@ -53,7 +62,18 @@ const REACT_SYSTEM_PROMPT = `You are a research/coding agent. You investigate by
 - Use the task tools to investigate. Read the files you need to answer the task.
 - When the task is complete, reply with the final answer as plain text and no tool calls.`;
 
-export type AgentMode = "cpat" | "react" | "threshold";
+const HARNESS_BASE_PROMPT = `You are a research and coding agent. You investigate systematically by calling tools and reasoning step by step.
+
+- Runtime-added [block:<id>] tags mark message blocks — NEVER write [block:...] tags in your own replies.
+- Gather exact facts (names, codenames, numbers, percentages, IDs/codes, dependencies, formulas) before answering.
+- When the current task or question is complete, reply with the final answer as plain text and no tool calls.`;
+
+export type AgentMode = "cpat" | "react" | "threshold" | "harness";
+
+export interface CustomToolSuite {
+  defs: ToolDefinition[];
+  dispatch: (name: string, argsJson: string) => Promise<string | undefined> | string | undefined;
+}
 
 export interface TurnLog {
   turn: number;
@@ -99,14 +119,30 @@ export interface RunMetrics {
   terminated_early: boolean;
   /** Peak estimated view tokens reached during the run. */
   peak_view_tokens: number;
+  /** Mean rendered view tokens across main LLM calls. */
+  mean_view_tokens: number;
+  /** Harness v2 metrics (0 on v1/react/threshold arms). */
+  harness_commits: number;
+  context_query_calls: number;
+  scopes_opened: number;
+  scopes_submitted: number;
+  /** Full cache-aware + sidecar USD & critical-path latency breakdown. */
+  cost: CostBreakdown;
 }
 
 export async function runAgent(opts: {
   task: string;
   config: CpatConfig;
-  client: DeepSeekClient;
+  client: ChatClient;
+  sidecarClient?: ChatClient;
   workdir: string;
   mode?: AgentMode;
+  harnessMode?: HarnessMode;
+  workingTailTokens?: number;
+  /** Optional custom environment tools (e.g. stateful telemetry stream). */
+  extraTools?: CustomToolSuite;
+  /** Optional custom base system prompt override. */
+  baseSystemPrompt?: string;
   /** Extra questions asked in sequence on the SAME runtime after the main task
    *  is answered. Context accumulates across questions — this is what exercises
    *  the offload→restore reversible cycle over a long-horizon loop. */
@@ -123,15 +159,23 @@ export async function runAgent(opts: {
    *  unaffected (still added for the cpat arm). */
   taskToolNames?: string[];
   onTurn?: (log: TurnLog) => void;
-}): Promise<RunResult & { runtime: ContextRuntime }> {
-  const { task, config, client, workdir, onTurn } = opts;
+}): Promise<RunResult & { runtime?: ContextRuntime; harness?: ContextHarness }> {
   const mode: AgentMode = opts.mode ?? "cpat";
+  if (mode === "harness") {
+    return runHarnessAgent(opts);
+  }
+
+  const { task, config, client, workdir, onTurn } = opts;
   const hardWindow = opts.hardWindowTokens ?? 0;
   const runtime = new ContextRuntime(config);
   const taskTools = new TaskTools(workdir);
-  const baseTaskTools = opts.taskToolNames
+  const filteredFsTools = opts.taskToolNames
     ? taskToolDefs.filter((t) => opts.taskToolNames!.includes(t.function.name))
     : taskToolDefs;
+  const baseTaskTools = [
+    ...filteredFsTools,
+    ...(opts.extraTools?.defs ?? []),
+  ];
   // Three-arm setup (aligned with CAT paper, arXiv:2512.22087):
   //   react     — no governance tool, no runtime safety net; append-only.
   //   threshold — runtime safety net (checkBudget auto-offloads at critical)
@@ -144,7 +188,15 @@ export async function runAgent(opts: {
 
   // react/threshold get the minimal prompt (no governance guidance); only cpat
   // is told to actively manage its context.
-  runtime.ingestSystem(mode === "cpat" ? SYSTEM_PROMPT : REACT_SYSTEM_PROMPT);
+  runtime.ingestSystem(
+    opts.baseSystemPrompt
+      ? mode === "cpat"
+        ? `${SYSTEM_PROMPT}\n\n${opts.baseSystemPrompt}`
+        : `${REACT_SYSTEM_PROMPT}\n\n${opts.baseSystemPrompt}`
+      : mode === "cpat"
+        ? SYSTEM_PROMPT
+        : REACT_SYSTEM_PROMPT,
+  );
   runtime.ingestUser(task);
 
   const turnLogs: TurnLog[] = [];
@@ -190,7 +242,7 @@ export async function runAgent(opts: {
 
     if (resp.message.tool_calls?.length) {
       for (const tc of resp.message.tool_calls) {
-        const output = dispatchTool(tc, runtime, taskTools, log);
+        const output = await dispatchTool(tc, runtime, taskTools, log, opts.extraTools);
         runtime.ingestToolResult(tc, output);
       }
 
@@ -279,7 +331,7 @@ export async function runAgent(opts: {
 
 async function runBoundaryMaintenance(opts: {
   runtime: ContextRuntime;
-  client: DeepSeekClient;
+  client: ChatClient;
   config: CpatConfig;
 }): Promise<void> {
   const { runtime, client, config } = opts;
@@ -322,12 +374,13 @@ function boundaryMaintenancePrompt(pressure: string): string {
   );
 }
 
-function dispatchTool(
+async function dispatchTool(
   tc: ToolCall,
   runtime: ContextRuntime,
   taskTools: TaskTools,
   log: TurnLog,
-): string {
+  extraTools?: CustomToolSuite,
+): Promise<string> {
   const name = tc.function.name;
   try {
     if (name === "context_update") {
@@ -350,10 +403,227 @@ function dispatchTool(
         ? payload.slice(0, max) + `\n…[truncated, full payload is ${payload.length} chars]`
         : payload;
     }
+    if (extraTools) {
+      const custom = await extraTools.dispatch(name, tc.function.arguments);
+      if (custom !== undefined) return custom;
+    }
     return taskTools.dispatch(name, tc.function.arguments);
   } catch (err) {
     return `error: ${err instanceof Error ? err.message : String(err)}`;
   }
+}
+
+async function runHarnessAgent(
+  opts: Parameters<typeof runAgent>[0],
+): Promise<RunResult & { harness: ContextHarness }> {
+  const { task, config, client, workdir, onTurn } = opts;
+  const sidecarClient =
+    opts.sidecarClient ??
+    (config.sidecarModel === "none"
+      ? undefined
+      : client instanceof DeepSeekClient
+        ? client
+        : undefined);
+
+  const harness = new ContextHarness(
+    {
+      maxContextTokens: config.maxContextTokens,
+      workingTailTokens: opts.workingTailTokens,
+      softLimitRatio: config.softLimitRatio,
+      mustActRatio: config.mustActRatio,
+      criticalRatio: config.criticalRatio,
+      mode: opts.harnessMode ?? "query_only",
+      sidecarModel:
+        config.sidecarModel && config.sidecarModel !== "none"
+          ? config.sidecarModel
+          : "deepseek-flash",
+      runDir: config.runDir,
+      verbose: config.verbose,
+    },
+    {
+      mainModel: config.model,
+      sidecarClient,
+    },
+  );
+
+  const taskTools = new TaskTools(workdir);
+  const filteredFsTools = opts.taskToolNames
+    ? taskToolDefs.filter((t) => opts.taskToolNames!.includes(t.function.name))
+    : taskToolDefs;
+  const baseTaskTools = [
+    ...filteredFsTools,
+    ...(opts.extraTools?.defs ?? []),
+  ];
+  const tools = harness.tools(baseTaskTools);
+
+  const sysPrompt = opts.baseSystemPrompt
+    ? `${HARNESS_BASE_PROMPT}\n\n${opts.baseSystemPrompt}`
+    : HARNESS_BASE_PROMPT;
+  harness.ingestSystem(sysPrompt);
+  harness.ingestUser(task);
+
+  const turnLogs: TurnLog[] = [];
+  const answers: string[] = [];
+  const pending = [...(opts.followups ?? [])];
+  let answer = "(max turns reached without a final answer)";
+  let peakViewTokens = 0;
+
+  for (let turn = 1; turn <= config.maxTurns; turn++) {
+    const { messages, view, decisionReason, freedThisTurn } =
+      await harness.compileTurn();
+
+    const estTokens = harness.estimatedUsed();
+    if (estTokens > peakViewTokens) peakViewTokens = estTokens;
+
+    const resp = await client.chat({ model: config.model, messages, tools });
+    harness.recordMainCall(config.model, resp.usage, view);
+    harness.ingestAssistant(resp.message);
+
+    const log: TurnLog = {
+      turn,
+      pressure: estTokens >= config.maxContextTokens * config.softLimitRatio ? "managed" : "ok",
+      fallbackOffloads: 0,
+      promptTokens: resp.usage.prompt_tokens,
+      cacheHitTokens: resp.usage.prompt_cache_hit_tokens ?? 0,
+      completionTokens: resp.usage.completion_tokens,
+      toolCalls: (resp.message.tool_calls ?? []).map((t) => t.function.name),
+      ...(freedThisTurn > 0 ? { patchSummary: decisionReason } : {}),
+    };
+
+    if (resp.message.tool_calls?.length) {
+      for (const tc of resp.message.tool_calls) {
+        let output: string;
+        try {
+          const handled = await harness.tryHandleToolCall(tc);
+          if (handled !== undefined) {
+            output = handled;
+          } else if (opts.extraTools) {
+            const custom = await opts.extraTools.dispatch(
+              tc.function.name,
+              tc.function.arguments,
+            );
+            output =
+              custom ?? taskTools.dispatch(tc.function.name, tc.function.arguments);
+          } else {
+            output = taskTools.dispatch(tc.function.name, tc.function.arguments);
+          }
+        } catch (err) {
+          output = `error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        harness.ingestToolResult(tc, output);
+      }
+    } else {
+      answer = resp.message.content ?? "";
+      answers.push(answer);
+      turnLogs.push(log);
+      onTurn?.(log);
+      if (pending.length > 0) {
+        harness.ingestUser(pending.shift()!, { isFollowupBoundary: true });
+        continue;
+      }
+      return {
+        answer,
+        answers,
+        turns: turn,
+        turnLogs,
+        metrics: collectHarnessMetrics(harness, peakViewTokens),
+        harness,
+      };
+    }
+
+    turnLogs.push(log);
+    onTurn?.(log);
+  }
+
+  harness.ingestUser(
+    "Turn limit reached. Produce your final answer now from what you already know. Do not request tools.",
+  );
+  const { messages, view } = await harness.compileTurn();
+  const resp = await client.chat({
+    model: config.model,
+    messages,
+    tools,
+    toolChoice: "none",
+  });
+  harness.recordMainCall(config.model, resp.usage, view);
+  harness.ingestAssistant(resp.message);
+  if (resp.message.content?.trim()) answer = resp.message.content;
+  answers.push(answer);
+  while (pending.length > 0) {
+    pending.shift();
+    answers.push("");
+  }
+
+  return {
+    answer,
+    answers,
+    turns: config.maxTurns,
+    turnLogs,
+    metrics: collectHarnessMetrics(harness, peakViewTokens),
+    harness,
+  };
+}
+
+function collectHarnessMetrics(
+  harness: ContextHarness,
+  peakViewTokens: number,
+): RunMetrics {
+  const usages: ChatUsage[] = [];
+  const viewEstimates: number[] = [];
+  let freed = 0;
+  const opsByType: Record<string, number> = {};
+
+  for (const e of harness.journal.events) {
+    if (e.type === "llm_call") {
+      usages.push(e.usage);
+      viewEstimates.push(e.est_view_tokens);
+    }
+    if (e.type === "patch" && e.result.ok) {
+      freed += e.result.freed_tokens;
+      for (const op of e.operations) {
+        opsByType[op.op] = (opsByType[op.op] ?? 0) + 1;
+      }
+    }
+  }
+
+  const prompt = usages.reduce((s, u) => s + u.prompt_tokens, 0);
+  const hit = usages.reduce((s, u) => s + (u.prompt_cache_hit_tokens ?? 0), 0);
+  const miss = usages.reduce(
+    (s, u) => s + (u.prompt_cache_miss_tokens ?? Math.max(0, u.prompt_tokens - (u.prompt_cache_hit_tokens ?? 0))),
+    0,
+  );
+  const visible = harness.blocks.visible();
+  const meanView =
+    viewEstimates.length > 0
+      ? Math.round(viewEstimates.reduce((s, x) => s + x, 0) / viewEstimates.length)
+      : 0;
+
+  return {
+    llm_calls: usages.length,
+    prompt_tokens: prompt,
+    completion_tokens: usages.reduce((s, u) => s + u.completion_tokens, 0),
+    cache_hit_tokens: hit,
+    cache_miss_tokens: miss,
+    cache_hit_ratio: prompt > 0 ? Number((hit / prompt).toFixed(3)) : 0,
+    agent_patches_applied: 0,
+    agent_patches_noop: 0,
+    agent_patches_rejected: 0,
+    runtime_fallback_offloads: 0,
+    governance_nudges: 0,
+    boundary_maintenance_calls: 0,
+    freed_tokens: freed,
+    ops_by_type: opsByType,
+    final_visible_tokens: visible.reduce((s, b) => s + b.token_count, 0),
+    final_visible_blocks: visible.length,
+    terminated_early: false,
+    peak_view_tokens: peakViewTokens,
+    mean_view_tokens: meanView,
+    harness_commits: harness.harnessCommits,
+    context_query_calls: harness.contextQueryCalls,
+    scopes_opened: harness.scopesOpened,
+    scopes_submitted: harness.scopesSubmitted,
+    cost: harness.costBreakdown(),
+  };
 }
 
 function collectMetrics(
@@ -364,14 +634,23 @@ function collectMetrics(
   peakViewTokens = 0,
 ): RunMetrics {
   const usages: ChatUsage[] = [];
+  const viewEstimates: number[] = [];
   let agentApplied = 0;
   let agentNoop = 0;
   let agentRejected = 0;
   let freed = 0;
   const opsByType: Record<string, number> = {};
+  const costTracker = new CostTracker({
+    mainPricing: pricingForModel(runtime.config.model),
+    sidecarPricing: pricingForModel(runtime.config.model),
+  });
 
   for (const e of runtime.journal.events) {
-    if (e.type === "llm_call") usages.push(e.usage);
+    if (e.type === "llm_call") {
+      usages.push(e.usage);
+      viewEstimates.push(e.est_view_tokens);
+      costTracker.recordMain(e.usage);
+    }
     if (e.type === "patch") {
       if (e.result.ok) {
         if (e.actor === "agent") {
@@ -390,8 +669,15 @@ function collectMetrics(
 
   const prompt = usages.reduce((s, u) => s + u.prompt_tokens, 0);
   const hit = usages.reduce((s, u) => s + (u.prompt_cache_hit_tokens ?? 0), 0);
-  const miss = usages.reduce((s, u) => s + (u.prompt_cache_miss_tokens ?? 0), 0);
+  const miss = usages.reduce(
+    (s, u) => s + (u.prompt_cache_miss_tokens ?? Math.max(0, u.prompt_tokens - (u.prompt_cache_hit_tokens ?? 0))),
+    0,
+  );
   const visible = runtime.blocks.visible();
+  const meanView =
+    viewEstimates.length > 0
+      ? Math.round(viewEstimates.reduce((s, x) => s + x, 0) / viewEstimates.length)
+      : 0;
 
   return {
     llm_calls: usages.length,
@@ -412,5 +698,11 @@ function collectMetrics(
     final_visible_blocks: visible.length,
     terminated_early: terminatedEarly,
     peak_view_tokens: peakViewTokens,
+    mean_view_tokens: meanView,
+    harness_commits: 0,
+    context_query_calls: 0,
+    scopes_opened: 0,
+    scopes_submitted: 0,
+    cost: costTracker.snapshot(),
   };
 }

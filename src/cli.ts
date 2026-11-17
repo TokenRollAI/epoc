@@ -1,9 +1,9 @@
 import { writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { CpatConfig } from "./types.ts";
-import { loadDeepSeekEnv } from "./util/env.ts";
+import { loadDeepSeekEnv, loadSidecarEnv } from "./util/env.ts";
 import { DeepSeekClient } from "./deepseek/client.ts";
-import { runAgent } from "./agent/loop.ts";
+import { runAgent, type AgentMode } from "./agent/loop.ts";
 
 const DEMO_TASK = `Investigate this repository and write a short technical report:
 1. What is the overall architecture? Walk through every source file under src/ and explain its role.
@@ -20,8 +20,10 @@ Usage:
   node src/cli.ts tui
 
 Options:
+  --mode <m>           harness | cpat | threshold | react (default: harness)
   --workdir <dir>      Tool sandbox root (default: cwd)
-  --model <name>       DeepSeek model (default: deepseek-v4-flash)
+  --model <name>       Main model (default: deepseek-flash)
+  --sidecar-model <m>  Cheap sidecar model for harness (default: deepseek-flash, or 'none')
   --max-context <n>    Working context budget in tokens (default: 16000;
                        keep it small to actually exercise budget pressure)
   --turns <n>          Max agent turns (default: 40)
@@ -32,7 +34,13 @@ Options:
   process.exit(1);
 }
 
-function parseArgs(argv: string[]): { task: string; config: CpatConfig; workdir: string; verbose: boolean } {
+function parseArgs(argv: string[]): {
+  task: string;
+  config: CpatConfig;
+  mode: AgentMode;
+  workdir: string;
+  verbose: boolean;
+} {
   if (argv[0] !== "run") usage();
   const rest = argv.slice(1);
   const flags = new Map<string, string | boolean>();
@@ -57,9 +65,17 @@ function parseArgs(argv: string[]): { task: string; config: CpatConfig; workdir:
   const task = demo ? DEMO_TASK : positional.join(" ");
   if (!task.trim()) usage();
 
+  const mode = String(flags.get("mode") ?? "harness") as AgentMode;
+  if (!["harness", "cpat", "threshold", "react"].includes(mode)) {
+    usage();
+  }
+
   const runDir = join("runs", new Date().toISOString().replace(/[:.]/g, "-"));
   const config: CpatConfig = {
-    model: String(flags.get("model") ?? "deepseek-v4-flash"),
+    model: String(flags.get("model") ?? "deepseek-flash"),
+    sidecarModel: flags.has("sidecar-model")
+      ? String(flags.get("sidecar-model"))
+      : undefined,
     maxContextTokens: Number(flags.get("max-context") ?? 16000),
     softLimitRatio: 0.7,
     mustActRatio: 0.8,
@@ -75,6 +91,7 @@ function parseArgs(argv: string[]): { task: string; config: CpatConfig; workdir:
   return {
     task,
     config,
+    mode,
     workdir: resolve(String(flags.get("workdir") ?? process.cwd())),
     verbose: config.verbose,
   };
@@ -95,17 +112,25 @@ async function main(): Promise<void> {
     await import("./tui.ts");
     return;
   }
-  const { task, config, workdir } = parseArgs(process.argv.slice(2));
+  const { task, config, mode, workdir } = parseArgs(process.argv.slice(2));
   const env = loadDeepSeekEnv();
   const client = new DeepSeekClient(env);
+  const sidecarEnv = loadSidecarEnv();
+  const sidecarClient =
+    config.sidecarModel === "none" ? undefined : new DeepSeekClient(sidecarEnv);
+  if (!config.sidecarModel) config.sidecarModel = sidecarEnv.model;
 
-  console.log(`model=${config.model}  budget=${config.maxContextTokens} tokens  workdir=${workdir}`);
+  console.log(
+    `mode=${mode}  model=${config.model}  sidecar=${config.sidecarModel}  budget=${config.maxContextTokens} tokens  workdir=${workdir}`,
+  );
   console.log(`run dir: ${config.runDir}\n`);
 
   const result = await runAgent({
     task,
     config,
     client,
+    sidecarClient,
+    mode,
     workdir,
     onTurn: (t) => {
       const cache = t.promptTokens > 0 ? ` cache ${Math.round((100 * t.cacheHitTokens) / t.promptTokens)}%` : "";

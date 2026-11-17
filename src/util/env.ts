@@ -59,3 +59,27 @@ export function loadDeepSeekEnv(cwd: string = process.cwd()): DeepSeekEnv {
   }
   return { baseUrl: baseUrl.replace(/\/+$/, ""), apiKey };
 }
+
+export interface SidecarEnv extends DeepSeekEnv {
+  model: string;
+}
+
+/**
+ * Loads optional cheap-model sidecar configuration, falling back to the primary
+ * DeepSeek endpoint + `deepseek-flash`.
+ */
+export function loadSidecarEnv(cwd: string = process.cwd()): SidecarEnv {
+  const primary = loadDeepSeekEnv(cwd);
+  const envPath = resolve(cwd, ".env");
+  const fileVars = existsSync(envPath)
+    ? parseDotEnv(readFileSync(envPath, "utf8"))
+    : {};
+  const vars: Record<string, string | undefined> = {
+    ...fileVars,
+    ...process.env,
+  };
+  const baseUrl = (vars.SIDECAR_BASE_URL ?? primary.baseUrl).replace(/\/+$/, "");
+  const apiKey = vars.SIDECAR_API_KEY ?? primary.apiKey;
+  const model = vars.SIDECAR_MODEL ?? "deepseek-flash";
+  return { baseUrl, apiKey, model };
+}

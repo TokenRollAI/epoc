@@ -28,6 +28,10 @@ export function resetIdCounter(): void {
   counter = 0;
 }
 
+export function bumpIdCounterAtLeast(minValue: number): void {
+  if (minValue > counter) counter = minValue;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }

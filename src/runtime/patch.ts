@@ -23,6 +23,7 @@ export interface PatchOutcome {
 
 interface StagedSummary {
   afterId: string | undefined; // insert position: after this block id
+  kind?: "summary" | "task_state";
   description: string;
   content: string;
   sourceIds: string[];
@@ -324,6 +325,90 @@ export function applyContextUpdate(
         collapseIntoBlock(i, ids, targets, `[folded scope: ${op.scope_label}] ${op.output.description}`, op.output.content);
         break;
       }
+
+      case "set_resolution": {
+        const valid = new Set(["full", "skeleton", "digest", "landmark"]);
+        if (!valid.has(op.resolution)) {
+          reject(i, "resolution_invalid", `invalid resolution "${op.resolution}"`);
+          return;
+        }
+        for (const b of targets) {
+          if (
+            op.resolution !== "full" &&
+            (b.epistemic === "authoritative" ||
+              b.kind === "user_message" ||
+              b.kind === "task_state" ||
+              b.protected)
+          ) {
+            reject(
+              i,
+              "resolution_authoritative",
+              `block "${b.id}" is authoritative/protected and must stay at "full" resolution`,
+            );
+            return;
+          }
+          if (
+            b.kind !== "tool_result" &&
+            b.kind !== "assistant_message" &&
+            b.kind !== "summary"
+          ) {
+            reject(
+              i,
+              "resolution_kind",
+              `block "${b.id}" (${b.kind}) does not support multi-resolution switching`,
+            );
+            return;
+          }
+          b.active_resolution = op.resolution;
+          b.token_count = estimateTokens(store.renderedText(b));
+        }
+        break;
+      }
+
+      case "set_pinned": {
+        for (const b of targets) {
+          b.pinned = Boolean(op.pinned);
+        }
+        break;
+      }
+
+      case "purge_pollution": {
+        let lastUserId: string | undefined;
+        for (const id of store.order) {
+          const b = store.get(id);
+          if (b && b.kind === "user_message") lastUserId = id;
+        }
+        for (const b of targets) {
+          if (
+            b.epistemic === "authoritative" ||
+            b.kind === "user_message" ||
+            b.kind === "task_state" ||
+            b.protected ||
+            b.id === lastUserId
+          ) {
+            reject(
+              i,
+              "purge_authoritative",
+              `block "${b.id}" is authoritative user/state context and cannot be purged`,
+            );
+            return;
+          }
+          b.visibility = "archived";
+        }
+        if (op.clean_checkpoint?.content?.trim()) {
+          const lastIdx = Math.max(...ids.map((id) => store.order.indexOf(id)));
+          summaries.push({
+            afterId: lastIdx >= 0 ? store.order[lastIdx] : undefined,
+            kind: "task_state",
+            description:
+              op.clean_checkpoint.description?.trim() ||
+              "Verified clean specification after pollution audit",
+            content: op.clean_checkpoint.content,
+            sourceIds: [...ids],
+          });
+        }
+        break;
+      }
     }
   });
 
@@ -370,13 +455,21 @@ export function applyContextUpdate(
       content.put(`${id}@v${clone.version}`, clone.content);
     }
     Object.assign(real, clone);
+    if (real.visibility !== "model" && real.api?.reasoning_content) {
+      delete real.api.reasoning_content;
+      for (const b of store.all()) {
+        if (b.kind === "reasoning_trace" && b.source_ids[0] === id && b.visibility === "api_required") {
+          b.visibility = "hidden";
+        }
+      }
+    }
   }
   const created: string[] = [];
   for (const s of summaries) {
     const block = store.create({
-      idPrefix: "summary",
+      idPrefix: s.kind === "task_state" ? "state" : "summary",
       role: "assistant",
-      kind: "summary",
+      kind: s.kind ?? "summary",
       description: describeText(s.description, ""),
       content: s.content,
       sourceIds: s.sourceIds,

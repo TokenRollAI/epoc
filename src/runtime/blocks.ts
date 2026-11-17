@@ -3,10 +3,13 @@ import type {
   BlockKind,
   ChatMessage,
   ContextBlock,
+  EpistemicTier,
+  FactDigest,
   Role,
   ToolCall,
   Visibility,
 } from "../types.ts";
+import { buildLandmark, extractSkeleton } from "../sidecar/skeleton.ts";
 import { estimateTokens, nextId, nowIso } from "../util/misc.ts";
 import { ContentStore, Journal } from "./stores.ts";
 
@@ -66,7 +69,40 @@ export class BlockStore {
         `(full payload recoverable at ${ref.uri} — ${ref.retrieval_hint})`
       );
     }
-    return block.content;
+    const res = block.active_resolution ?? "full";
+    if (res === "full") {
+      return block.content;
+    }
+    const rawTok = block.raw_tokens ?? block.token_count;
+    if (res === "digest") {
+      const d = block.resolutions?.digest;
+      if (d) {
+        return formatDigestProjection(block.id, rawTok, d);
+      }
+      if (block.resolutions?.skeleton) return block.resolutions.skeleton;
+    }
+    if (res === "skeleton" && block.resolutions?.skeleton) {
+      return block.resolutions.skeleton;
+    }
+    if (res === "landmark" && block.resolutions?.landmark) {
+      return block.resolutions.landmark;
+    }
+    return block.resolutions?.skeleton ?? block.resolutions?.landmark ?? block.content;
+  }
+
+  /** Attach an asynchronously computed FactDigest without mutating rendered bytes until resolution flips. */
+  attachDigest(blockId: string, digest: FactDigest): void {
+    const block = this.map.get(blockId);
+    if (!block) return;
+    if (!block.resolutions) {
+      const text = typeof block.content === "string" ? block.content : "";
+      block.resolutions = {
+        landmark: buildLandmark(block.id, block.description, block.raw_tokens ?? block.token_count, text.split("\n").length),
+      };
+    }
+    // Preserve byte stability: if already rendering as digest, do not overwrite.
+    if (block.active_resolution === "digest" && block.resolutions.digest) return;
+    block.resolutions.digest = digest;
   }
 
   create(opts: {
@@ -78,11 +114,21 @@ export class BlockStore {
     sourceIds?: string[];
     visibility?: Visibility;
     retention?: ContextBlock["retention"];
+    epistemic?: EpistemicTier;
+    scopeId?: string;
     protected?: boolean;
     api?: ContextBlock["api"];
     insertAfter?: string;
   }): ContextBlock {
     const id = nextId(opts.idPrefix);
+    const rawTok = estimateTokens(opts.content);
+    const lineCount = opts.content.split("\n").length;
+    const epistemic: EpistemicTier =
+      opts.epistemic ?? defaultEpistemicTier(opts.kind);
+    const shouldPrecomputeSkeleton =
+      rawTok >= 220 &&
+      (opts.kind === "tool_result" || opts.kind === "assistant_message");
+
     const block: ContextBlock = {
       id,
       role: opts.role,
@@ -90,9 +136,19 @@ export class BlockStore {
       description: opts.description,
       content: opts.content,
       source_ids: opts.sourceIds ?? [],
-      token_count: estimateTokens(opts.content),
+      token_count: rawTok,
+      raw_tokens: rawTok,
       visibility: opts.visibility ?? "model",
       retention: opts.retention ?? "session",
+      epistemic,
+      active_resolution: "full",
+      resolutions: {
+        landmark: buildLandmark(id, opts.description, rawTok, lineCount),
+        ...(shouldPrecomputeSkeleton
+          ? { skeleton: extractSkeleton(id, opts.description, opts.content) }
+          : {}),
+      },
+      ...(opts.scopeId ? { scope_id: opts.scopeId } : {}),
       protected: opts.protected,
       version: 1,
       created_at: nowIso(),
@@ -149,7 +205,7 @@ export class BlockStore {
    * thinking mode returned reasoning alongside tool calls, an api_required
    * reasoning_trace block (DeepSeek requires replay while the chain is open).
    */
-  createAssistantMessage(msg: ChatMessage): {
+  createAssistantMessage(msg: ChatMessage, scopeId?: string): {
     block: ContextBlock;
     reasoning?: ContextBlock;
   } {
@@ -164,9 +220,10 @@ export class BlockStore {
         msg.content ?? "",
       ),
       content: msg.content ?? "",
+      scopeId,
       api: msg.tool_calls?.length ? { tool_calls: msg.tool_calls } : undefined,
     });
-    let reasoning: ContextBlock | undefined;
+    let reasoning: ContextBlock;
     if (msg.reasoning_content && msg.tool_calls?.length) {
       reasoning = this.create({
         idPrefix: "reasoning",
@@ -177,16 +234,19 @@ export class BlockStore {
         sourceIds: [block.id],
         visibility: "api_required",
         retention: "ephemeral",
+        scopeId,
       });
       block.api = { ...block.api, reasoning_content: msg.reasoning_content };
+      return { block, reasoning };
     }
-    return { block, reasoning };
+    return { block };
   }
 
   createToolResult(
     toolCall: ToolCall,
     output: string,
     description: string,
+    scopeId?: string,
   ): ContextBlock {
     return this.create({
       idPrefix: "tool",
@@ -194,6 +254,7 @@ export class BlockStore {
       kind: "tool_result",
       description,
       content: output,
+      scopeId,
       api: { tool_call_id: toolCall.id, name: toolCall.function.name },
     });
   }
@@ -252,6 +313,19 @@ export class BlockStore {
     return groups;
   }
 
+  /** Expand any set of block ids into complete tool-call chains in block order. */
+  expandToChainClosure(ids: string[]): string[] {
+    const expanded = new Set<string>();
+    for (const id of ids) {
+      const b = this.get(id);
+      if (!b) continue;
+      for (const member of this.chainOf(b)) {
+        expanded.add(member.id);
+      }
+    }
+    return this.order.filter((id) => expanded.has(id));
+  }
+
   // -- generational tail bookkeeping -----------------------------------------
 
   /** Generation id a block currently belongs to, or undefined if untracked. */
@@ -268,6 +342,44 @@ export class BlockStore {
   allocGeneration(): number {
     return this.nextGen++;
   }
+}
+
+function defaultEpistemicTier(kind: BlockKind): EpistemicTier {
+  switch (kind) {
+    case "system_prompt":
+    case "user_message":
+    case "task_state":
+      return "authoritative";
+    case "tool_result":
+    case "artifact_ref":
+    case "budget_report":
+      return "observation";
+    case "assistant_message":
+    case "reasoning_trace":
+    case "summary":
+      return "subjective";
+  }
+}
+
+export function formatDigestProjection(
+  blockId: string,
+  rawTokens: number,
+  d: FactDigest,
+): string {
+  const lines = [
+    `[context:digest #${blockId} | raw ${rawTokens} tok indexed — call context_query(block_ids:["${blockId}"], ...) for exact lines]`,
+    `Summary: ${d.summary}`,
+  ];
+  if (d.verbatim_facts.length > 0) {
+    lines.push(`Verbatim facts: ${d.verbatim_facts.join(" | ")}`);
+  }
+  if (d.ruled_out.length > 0) {
+    lines.push(`Ruled out: ${d.ruled_out.join(" | ")}`);
+  }
+  if (d.query_hint) {
+    lines.push(`Query hint: ${d.query_hint}`);
+  }
+  return lines.join("\n");
 }
 
 export function describeText(prefix: string, content: string): string {
